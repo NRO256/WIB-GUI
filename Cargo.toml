@@ -1,0 +1,22 @@
+[package]
+name = "wib-gui"
+version = "0.1.1"
+authors = ["NRO / Antigravity"]
+edition = "2024"
+description = "Portable Win32 GUI Wrapper for Windows wbadmin (WindowsImageBackup)"
+license = "MIT"
+
+[lib]
+name = "wib_gui_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "WIB-GUI"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
