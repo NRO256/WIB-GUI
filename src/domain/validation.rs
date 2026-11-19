@@ -16,6 +16,19 @@ impl DriveInfo {
         self.fs_name.eq_ignore_ascii_case("NTFS")
     }
 
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.free_bytes)
+    }
+
+    pub fn kind_label(&self) -> String {
+        match (self.is_system, self.disk_number) {
+            (true, Some(n)) => format!("システム (ディスク {n})"),
+            (true, None) => "システムドライブ".to_string(),
+            (false, Some(n)) => format!("固定ディスク (ディスク {n})"),
+            (false, None) => "固定ディスク".to_string(),
+        }
+    }
+
     pub fn format_display(&self) -> String {
         let label = if self.label.is_empty() {
             "ローカル ディスク"
@@ -274,6 +287,96 @@ pub fn validate_backup_plan(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanCheckOutcome {
+    Ok {
+        estimated_used_bytes: u64,
+        target_free_bytes: Option<u64>,
+    },
+    LowSpaceWarning {
+        estimated_used_bytes: u64,
+        target_free_bytes: u64,
+        target_drive: char,
+    },
+}
+
+/// 妥当性検証に加えて保存先の空き容量目安を評価する。
+pub fn evaluate_backup_plan(
+    includes: &[char],
+    target: &BackupTarget,
+    drives: &[DriveInfo],
+) -> Result<PlanCheckOutcome, ValidationError> {
+    validate_backup_plan(includes, target, drives)?;
+
+    let mut seen = [false; 26];
+    let mut estimated_used_bytes: u64 = 0;
+    for &c in includes {
+        let upper = c.to_ascii_uppercase();
+        if upper.is_ascii_uppercase() {
+            let idx = (upper as u8 - b'A') as usize;
+            if seen[idx] {
+                continue;
+            }
+            seen[idx] = true;
+        }
+        if let Some(info) = drives
+            .iter()
+            .find(|d| d.letter.eq_ignore_ascii_case(&upper))
+        {
+            estimated_used_bytes = estimated_used_bytes.saturating_add(info.used_bytes());
+        }
+    }
+
+    match target {
+        BackupTarget::LocalDrive(tc) => {
+            let target_drive = tc.to_ascii_uppercase();
+            if let Some(target_info) = drives
+                .iter()
+                .find(|d| d.letter.eq_ignore_ascii_case(&target_drive))
+            {
+                if estimated_used_bytes > 0 && target_info.free_bytes < estimated_used_bytes {
+                    Ok(PlanCheckOutcome::LowSpaceWarning {
+                        estimated_used_bytes,
+                        target_free_bytes: target_info.free_bytes,
+                        target_drive,
+                    })
+                } else {
+                    Ok(PlanCheckOutcome::Ok {
+                        estimated_used_bytes,
+                        target_free_bytes: Some(target_info.free_bytes),
+                    })
+                }
+            } else {
+                Ok(PlanCheckOutcome::Ok {
+                    estimated_used_bytes,
+                    target_free_bytes: None,
+                })
+            }
+        }
+        BackupTarget::NetworkUnc { .. } => Ok(PlanCheckOutcome::Ok {
+            estimated_used_bytes,
+            target_free_bytes: None,
+        }),
+    }
+}
+
+pub fn format_gib(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+pub fn format_elapsed(total_secs: u64) -> String {
+    if total_secs < 3600 {
+        format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
+    } else {
+        format!(
+            "{}:{:02}:{:02}",
+            total_secs / 3600,
+            (total_secs % 3600) / 60,
+            total_secs % 60
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +485,92 @@ mod tests {
         );
         assert!(validate_credentials(None, Some("pass")).is_err());
         assert!(validate_credentials(Some("user\"bad"), Some("pass")).is_err());
+    }
+
+    #[test]
+    fn test_drive_info_helpers_and_formatters() {
+        let drives = sample_drives();
+        assert_eq!(drives[0].used_bytes(), 156 * 1024 * 1024 * 1024);
+        assert_eq!(drives[0].kind_label(), "システム (ディスク 0)");
+        assert_eq!(drives[1].kind_label(), "固定ディスク (ディスク 1)");
+
+        let no_disk_sys = DriveInfo {
+            disk_number: None,
+            ..drives[0].clone()
+        };
+        let no_disk_data = DriveInfo {
+            disk_number: None,
+            ..drives[1].clone()
+        };
+        assert_eq!(no_disk_sys.kind_label(), "システムドライブ");
+        assert_eq!(no_disk_data.kind_label(), "固定ディスク");
+
+        assert_eq!(format_gib(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_elapsed(0), "00:00");
+        assert_eq!(format_elapsed(65), "01:05");
+        assert_eq!(format_elapsed(3661), "1:01:01");
+    }
+
+    #[test]
+    fn test_evaluate_backup_plan() {
+        let mut drives = sample_drives();
+        // C: 使用量 156GB, D: 空き 500GB -> Ok
+        assert_eq!(
+            evaluate_backup_plan(&['C', 'c'], &BackupTarget::LocalDrive('d'), &drives),
+            Ok(PlanCheckOutcome::Ok {
+                estimated_used_bytes: 156 * 1024 * 1024 * 1024,
+                target_free_bytes: Some(500 * 1024 * 1024 * 1024),
+            })
+        );
+
+        // UNC -> Ok (target_free_bytes: None)
+        let unc = BackupTarget::NetworkUnc {
+            path: "\\\\NAS01\\Backup".to_string(),
+            user: None,
+            password: None,
+        };
+        assert_eq!(
+            evaluate_backup_plan(&['C'], &unc, &drives),
+            Ok(PlanCheckOutcome::Ok {
+                estimated_used_bytes: 156 * 1024 * 1024 * 1024,
+                target_free_bytes: None,
+            })
+        );
+
+        // D: 空きを 100GB に減らす -> LowSpaceWarning
+        drives[1].free_bytes = 100 * 1024 * 1024 * 1024;
+        assert_eq!(
+            evaluate_backup_plan(&['C'], &BackupTarget::LocalDrive('D'), &drives),
+            Ok(PlanCheckOutcome::LowSpaceWarning {
+                estimated_used_bytes: 156 * 1024 * 1024 * 1024,
+                target_free_bytes: 100 * 1024 * 1024 * 1024,
+                target_drive: 'D',
+            })
+        );
+
+        // エラー伝播
+        assert_eq!(
+            evaluate_backup_plan(&[], &BackupTarget::LocalDrive('D'), &drives),
+            Err(ValidationError::NoIncludeDrives)
+        );
+        assert_eq!(
+            evaluate_backup_plan(&['C'], &BackupTarget::LocalDrive('C'), &drives),
+            Err(ValidationError::SameDrive('C'))
+        );
+        assert_eq!(
+            evaluate_backup_plan(&['C'], &BackupTarget::LocalDrive('E'), &drives),
+            Err(ValidationError::SamePhysicalDisk {
+                include_drive: 'C',
+                target_drive: 'E',
+                disk_number: 0,
+            })
+        );
+        assert_eq!(
+            evaluate_backup_plan(&['C'], &BackupTarget::LocalDrive('F'), &drives),
+            Err(ValidationError::NotNtfs {
+                drive: 'F',
+                fs_name: "exFAT".to_string(),
+            })
+        );
     }
 }

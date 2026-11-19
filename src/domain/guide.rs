@@ -14,6 +14,15 @@ pub fn generate_restore_guide(target_input: &str, version_input: &str) -> String
         version_trimmed
     };
 
+    let dir_drive = if target.len() == 2
+        && target.as_bytes()[0].is_ascii_alphabetic()
+        && target.as_bytes()[1] == b':'
+    {
+        target
+    } else {
+        "D:"
+    };
+
     format!(
         "============================================================\r\n\
          Windows システムイメージ 復元手順ガイド\r\n\
@@ -51,8 +60,8 @@ pub fn generate_restore_guide(target_input: &str, version_input: &str) -> String
             diskpart\r\n\
             list volume\r\n\
             exit\r\n\
-            dir D:\\WindowsImageBackup\r\n\
-            （D: の部分は list volume で確認した保存先ドライブ文字に読み替えてください）\r\n\
+            dir {dir_drive}\\WindowsImageBackup\r\n\
+            （{dir_drive} の部分は list volume で確認した保存先ドライブ文字に読み替えてください）\r\n\
          3. 保存先にあるバックアップのバージョン識別子（日時）を確認します。\r\n\
             wbadmin get versions -backupTarget:{target}\r\n\
          4. 以下のコマンドを実行して復元を開始します（確認メッセージが出たら Y を入力して Enter）。\r\n\
@@ -97,6 +106,20 @@ mod tests {
     fn test_generate_restore_guide_defaults_when_empty() {
         let text = generate_restore_guide("", "  ");
         assert!(text.contains("-backupTarget:D:"));
+        assert!(text.contains("dir D:\\WindowsImageBackup"));
         assert!(text.contains("<バージョン識別子"));
+    }
+
+    #[test]
+    fn test_generate_restore_guide_dir_drive_for_local_and_unc() {
+        let local = generate_restore_guide("E:", "");
+        assert!(local.contains("dir E:\\WindowsImageBackup"));
+        assert!(local.contains(
+            "（E: の部分は list volume で確認した保存先ドライブ文字に読み替えてください）"
+        ));
+
+        let unc = generate_restore_guide("\\\\NAS01\\Backup", "11/17/2026-00:30");
+        assert!(unc.contains("dir D:\\WindowsImageBackup"));
+        assert!(unc.contains("-backupTarget:\\\\NAS01\\Backup"));
     }
 }

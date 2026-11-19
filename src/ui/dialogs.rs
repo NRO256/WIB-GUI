@@ -26,9 +26,14 @@ pub fn confirm_backup_start(
     includes_disp: &str,
     target_disp: &str,
     command_preview: &str,
+    low_space_warning: Option<&str>,
 ) -> bool {
+    let warn_block = match low_space_warning {
+        Some(w) => format!("【容量に関する警告】\n{w}\n\n"),
+        None => String::new(),
+    };
     let msg = format!(
-        "以下の内容でシステムイメージのバックアップを開始します。\n\n\
+        "{warn_block}以下の内容でシステムイメージのバックアップを開始します。\n\n\
          ・対象ドライブ: {includes_disp}\n\
          ・保存先: {target_disp}\n\
          ・実行コマンド: {command_preview}\n\n\

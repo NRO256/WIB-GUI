@@ -1,9 +1,11 @@
 use crate::platform::win32::{
-    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, CF_UNICODETEXT, CloseClipboard,
-    CoTaskMemFree, EmptyClipboard, GMEM_MOVEABLE, GetSaveFileNameW, GlobalAlloc, GlobalFree,
-    GlobalLock, GlobalUnlock, HWND, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
-    OPENFILENAMEW, OpenClipboard, SHBrowseForFolderW, SHGetPathFromIDListW, SetClipboardData,
-    from_wide_slice, to_wide_null,
+    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, CF_UNICODETEXT, CLSCTX_INPROC_SERVER,
+    CLSID_FILE_OPEN_DIALOG, CloseClipboard, CoCreateInstance, CoTaskMemFree, DWORD, EmptyClipboard,
+    FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, GMEM_MOVEABLE, GetSaveFileNameW,
+    GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, HRESULT_CANCELLED, HWND, IFileOpenDialog,
+    IID_IFILE_OPEN_DIALOG, IShellItem, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW, OpenClipboard, SHBrowseForFolderW, SHGetPathFromIDListW, SIGDN_FILESYSPATH,
+    SetClipboardData, from_wide_ptr, from_wide_slice, to_wide_null,
 };
 use std::path::PathBuf;
 
@@ -44,6 +46,7 @@ pub fn copy_to_clipboard(hwnd: HWND, text: &str) -> Result<(), String> {
 /// 名前を付けて保存ダイアログを開き、UTF-8 BOM付きテキストとして保存する。
 pub fn save_text_with_dialog(
     hwnd: HWND,
+    dialog_title: &str,
     default_filename: &str,
     content: &str,
 ) -> Result<Option<PathBuf>, String> {
@@ -58,7 +61,7 @@ pub fn save_text_with_dialog(
         .encode_utf16()
         .collect();
     let def_ext = to_wide_null("txt");
-    let title = to_wide_null("復元手順をテキストファイルに保存");
+    let title = to_wide_null(dialog_title);
 
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
@@ -86,8 +89,87 @@ pub fn save_text_with_dialog(
     Ok(Some(path))
 }
 
-/// フォルダ選択ダイアログを開く（UNC共有フォルダ参照用）。
+struct FileOpenDialogGuard(*mut IFileOpenDialog);
+
+impl Drop for FileOpenDialogGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                ((*(*self.0).lpVtbl).Release)(self.0.cast());
+            }
+        }
+    }
+}
+
+struct ShellItemGuard(*mut IShellItem);
+
+impl Drop for ShellItemGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                ((*(*self.0).lpVtbl).Release)(self.0.cast());
+            }
+        }
+    }
+}
+
+/// フォルダ選択ダイアログを開く（IFileOpenDialog 優先、失敗時は SHBrowseForFolderW フォールバック）。
 pub fn browse_folder_dialog(hwnd: HWND, prompt: &str) -> Option<String> {
+    let clsid = CLSID_FILE_OPEN_DIALOG;
+    let iid = IID_IFILE_OPEN_DIALOG;
+    let mut raw_dialog: *mut std::ffi::c_void = std::ptr::null_mut();
+    let hr_create = unsafe {
+        CoCreateInstance(
+            &raw const clsid,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &raw const iid,
+            &raw mut raw_dialog,
+        )
+    };
+    if hr_create < 0 || raw_dialog.is_null() {
+        return browse_folder_dialog_legacy(hwnd, prompt);
+    }
+
+    let dialog = FileOpenDialogGuard(raw_dialog.cast::<IFileOpenDialog>());
+    unsafe {
+        let mut opts: DWORD = 0;
+        let hr_get = ((*(*dialog.0).lpVtbl).GetOptions)(dialog.0.cast(), &raw mut opts);
+        if hr_get >= 0 {
+            let new_opts = opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+            ((*(*dialog.0).lpVtbl).SetOptions)(dialog.0.cast(), new_opts);
+        }
+        let title_w = to_wide_null(prompt);
+        ((*(*dialog.0).lpVtbl).SetTitle)(dialog.0.cast(), title_w.as_ptr());
+
+        let hr_show = ((*(*dialog.0).lpVtbl).Show)(dialog.0.cast(), hwnd);
+        if hr_show == HRESULT_CANCELLED || hr_show < 0 {
+            return None;
+        }
+
+        let mut raw_item: *mut IShellItem = std::ptr::null_mut();
+        let hr_res = ((*(*dialog.0).lpVtbl).GetResult)(dialog.0.cast(), &raw mut raw_item);
+        if hr_res < 0 || raw_item.is_null() {
+            return None;
+        }
+        let item = ShellItemGuard(raw_item);
+
+        let mut path_ptr: *mut u16 = std::ptr::null_mut();
+        let hr_name = ((*(*item.0).lpVtbl).GetDisplayName)(
+            item.0.cast(),
+            SIGDN_FILESYSPATH,
+            &raw mut path_ptr,
+        );
+        if hr_name < 0 || path_ptr.is_null() {
+            return None;
+        }
+        let path = from_wide_ptr(path_ptr);
+        CoTaskMemFree(path_ptr.cast());
+        if path.is_empty() { None } else { Some(path) }
+    }
+}
+
+fn browse_folder_dialog_legacy(hwnd: HWND, prompt: &str) -> Option<String> {
     let title_w = to_wide_null(prompt);
     let mut display_buf = [0u16; 260];
     let mut bi = BROWSEINFOW {
